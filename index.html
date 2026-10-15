@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>社區智慧藍牙門禁</title>
+  <style>
+    :root { --primary: #2563eb; --success: #16a34a; --bg: #0f172a; --card: #1e293b; --text: #f8fafc; }
+    * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { margin: 0; padding: 20px; background: var(--bg); color: var(--text); display: flex; flex-direction: column; align-items: center; min-height: 100vh; }
+    .container { width: 100%; max-width: 400px; background: var(--card); border-radius: 20px; padding: 28px 22px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); text-align: center; margin-top: 20px; }
+    h1 { font-size: 22px; margin: 0 0 8px 0; }
+    .badge { display: inline-block; background: #334155; color: #94a3b8; font-size: 13px; padding: 4px 12px; border-radius: 99px; margin-bottom: 24px; }
+    .open-btn { width: 190px; height: 190px; border-radius: 50%; border: none; background: radial-gradient(circle at 30% 30%, #3b82f6, #1d4ed8); color: white; font-size: 24px; font-weight: bold; cursor: pointer; box-shadow: 0 0 35px rgba(37,99,235,0.6), inset 0 4px 10px rgba(255,255,255,0.3); transition: all 0.2s; display: flex; flex-direction: column; align-items: center; justify-content: center; margin: 0 auto 24px auto; user-select: none; }
+    .open-btn:active { transform: scale(0.94); }
+    .open-btn.success { background: radial-gradient(circle at 30% 30%, #22c55e, #15803d); box-shadow: 0 0 35px rgba(34,197,94,0.6); }
+    .status { min-height: 24px; font-size: 15px; color: #cbd5e1; margin-bottom: 10px; }
+    .admin-toggle { margin-top: 30px; color: #64748b; font-size: 13px; background: none; border: none; cursor: pointer; text-decoration: underline; }
+    .admin-panel { display: none; width: 100%; max-width: 400px; background: #1e293b; border: 1px solid #334155; border-radius: 16px; padding: 20px; margin-top: 16px; text-align: left; }
+    .admin-panel h3 { margin: 0 0 12px 0; font-size: 16px; color: #38bdf8; }
+    label { display: block; font-size: 13px; color: #94a3b8; margin: 10px 0 4px 0; }
+    input, select { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: white; font-size: 15px; }
+    .btn-sm { width: 100%; padding: 11px; margin-top: 12px; border: none; border-radius: 8px; background: #0284c7; color: white; font-weight: bold; cursor: pointer; font-size: 14px; }
+    .url-box { margin-top: 12px; padding: 10px; background: #0f172a; border-radius: 8px; word-break: break-all; font-size: 12px; color: #a7f3d0; border: 1px dashed #059669; display: none; }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <h1>🏢 社區智慧門禁</h1>
+    <div class="badge" id="userBadge">尚未綁定住戶憑證</div>
+
+    <button class="open-btn" id="openBtn" onclick="triggerDoor()">
+      <span style="font-size: 42px; margin-bottom: 6px;">🔓</span>
+      <span id="btnText">點擊開門</span>
+    </button>
+
+    <div class="status" id="statusMsg">請站在門禁讀卡機前點擊按鈕</div>
+  </div>
+
+  <button class="admin-toggle" onclick="toggleAdmin()">⚙️ 工程測試與管理員發卡面板</button>
+
+  <!-- 管理員發卡與現場 W26/W34 測試面板 -->
+  <div class="admin-panel" id="adminPanel">
+    <h3>🛠️ 1. 現場直接變更目前手機測試卡號</h3>
+    <label>選擇訊號格式（測試 ST-18AM 建議先選「26+34 雙發」）：</label>
+    <select id="adminMode">
+      <option value="BOTH">🔄 Wiegand 26 + 34 自動雙發 (現場測試首選)</option>
+      <option value="W26">標準 Wiegand 26 (24-bit 卡號)</option>
+      <option value="W34">標準 Wiegand 34 (32-bit 卡號)</option>
+    </select>
+
+    <label>輸入要模擬的虛擬卡號 (純數字，對應 SOCA-ONE 卡號)：</label>
+    <input type="number" id="adminCard" value="123456" placeholder="例如: 123456">
+
+    <button class="btn-sm" onclick="applyToThisPhone()">套用到我目前這支手機並綁定</button>
+    <button class="btn-sm" style="background:#4f46e5;" onclick="generateResidentLink()">🔗 產生住戶專屬開門連結</button>
+
+    <div class="url-box" id="urlBox"></div>
+  </div>
+
+<script>
+  // ★ 必須與 ESP32 韌體中的 SECRET_KEY 完全一致
+  const SECRET_KEY = "SOCA_ST18AM_8888";
+  const SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+  const CHAR_UUID    = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+
+  // FNV-1a 32-bit 雜湊簽章演算法 (與 ESP32 C++ 100% 同步)
+  function calcSignature(mode, cardStr, secret) {
+    const raw = `${mode}:${cardStr}:${secret}`;
+    let hash = 2166136261;
+    for (let i = 0; i < raw.length; i++) {
+      hash ^= raw.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16).toUpperCase().padStart(8, '0');
+  }
+
+  // 初始化：檢查網址是否有帶住戶憑證參數 (?card=xxx&mode=W26&sign=xxx)
+  function initCredential() {
+    const params = new URLSearchParams(window.location.search);
+    if (params.has('card') && params.has('mode') && params.has('sign')) {
+      localStorage.setItem('door_card', params.get('card'));
+      localStorage.setItem('door_mode', params.get('mode'));
+      localStorage.setItem('door_sign', params.get('sign'));
+      // 清除網址列參數讓畫面乾淨
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+
+    // 若完全沒綁定過，預設載入工程測試卡號 123456 (雙發模式)
+    if (!localStorage.getItem('door_card')) {
+      const defCard = "123456";
+      const defMode = "BOTH";
+      localStorage.setItem('door_card', defCard);
+      localStorage.setItem('door_mode', defMode);
+      localStorage.setItem('door_sign', calcSignature(defMode, defCard, SECRET_KEY));
+    }
+    updateBadgeUI();
+  }
+
+  function updateBadgeUI() {
+    const card = localStorage.getItem('door_card');
+    const mode = localStorage.getItem('door_mode');
+    const modeName = (mode === 'BOTH') ? 'W26+W34雙發' : mode;
+    document.getElementById('userBadge').innerText = `已綁定卡號：${card} (${modeName})`;
+  }
+
+  // 一鍵藍牙開門主程式
+  async function triggerDoor() {
+    const statusEl = document.getElementById('statusMsg');
+    const btnEl = document.getElementById('openBtn');
+    const btnText = document.getElementById('btnText');
+
+    if (!navigator.bluetooth) {
+      statusEl.innerText = "⚠️ 請使用 Android Chrome 或 iOS Bluefy 瀏覽器開啟";
+      return;
+    }
+
+    const card = localStorage.getItem('door_card');
+    const mode = localStorage.getItem('door_mode');
+    const sign = localStorage.getItem('door_sign');
+    const payload = `${mode}:${card}:${sign}`;
+
+    let device = null;
+    try {
+      statusEl.innerText = "🔍 正在搜尋門禁藍牙 (ESP32_DoorLock)...";
+      device = await navigator.bluetooth.requestDevice({
+        filters: [{ name: 'ESP32_DoorLock' }],
+        optionalServices: [SERVICE_UUID]
+      });
+
+      statusEl.innerText = "⚡ 連線中，正在發送加密通行證...";
+      const server = await device.gatt.connect();
+      const service = await server.getPrimaryService(SERVICE_UUID);
+      const characteristic = await service.getCharacteristic(CHAR_UUID);
+
+      const encoder = new TextEncoder();
+      await characteristic.writeValue(encoder.encode(payload));
+
+      // 開門成功視覺回饋
+      btnEl.classList.add('success');
+      btnText.innerText = "已開門！";
+      statusEl.innerText = `✅ 已發送卡號 ${card}，請通行！`;
+
+      // 關鍵：發送後立即主動斷開藍牙，讓下一位住戶能馬上連線
+      setTimeout(() => {
+        if (device && device.gatt.connected) device.gatt.disconnect();
+      }, 300);
+
+      setTimeout(() => {
+        btnEl.classList.remove('success');
+        btnText.innerText = "點擊開門";
+        statusEl.innerText = "請站在門禁讀卡機前點擊按鈕";
+      }, 3000);
+
+    } catch (err) {
+      statusEl.innerText = "❌ 取消或連線失敗：" + err.message;
+      if (device && device.gatt && device.gatt.connected) {
+        device.gatt.disconnect();
+      }
+    }
+  }
+
+  // 管理員面板開關 (預設密碼 8888)
+  function toggleAdmin() {
+    const panel = document.getElementById('adminPanel');
+    if (panel.style.display === 'block') {
+      panel.style.display = 'none';
+      return;
+    }
+    const pwd = prompt("請輸入工程管理密碼 (預設 8888)：");
+    if (pwd === "8888") {
+      panel.style.display = 'block';
+    } else if (pwd !== null) {
+      alert("密碼錯誤！");
+    }
+  }
+
+  function applyToThisPhone() {
+    const mode = document.getElementById('adminMode').value;
+    const card = document.getElementById('adminCard').value.trim();
+    if (!card) return alert("請輸入卡號！");
+    const sign = calcSignature(mode, card, SECRET_KEY);
+    localStorage.setItem('door_card', card);
+    localStorage.setItem('door_mode', mode);
+    localStorage.setItem('door_sign', sign);
+    updateBadgeUI();
+    alert(`已將本機切換為卡號：${card} (${mode})`);
+  }
+
+  function generateResidentLink() {
+    const mode = document.getElementById('adminMode').value;
+    const card = document.getElementById('adminCard').value.trim();
+    if (!card) return alert("請輸入住戶卡號！");
+    const sign = calcSignature(mode, card, SECRET_KEY);
+    const baseUrl = window.location.origin + window.location.pathname;
+    const fullUrl = `${baseUrl}?card=${card}&mode=${mode}&sign=${sign}`;
+
+    const box = document.getElementById('urlBox');
+    box.style.display = 'block';
+    box.innerHTML = `<strong>📋 住戶 (${card}) 專屬綁定連結：</strong><br>${fullUrl}<br><br><button class="btn-sm" style="margin-top:4px;background:#059669;" onclick="navigator.clipboard.writeText('${fullUrl}');alert('已複製連結！可直接貼給住戶');">點此複製連結</button>`;
+  }
+
+  initCredential();
+</script>
+</body>
+</html>
